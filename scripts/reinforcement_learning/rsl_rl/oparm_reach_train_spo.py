@@ -41,6 +41,7 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.joint_pos_env_cfg import (
     OpenArmReachEnvCfg,
+    OpenArmReachEnvCfgErrObs,
 )
 import isaaclab_tasks.manager_based.manipulation.reach.mdp as reach_mdp
 
@@ -235,7 +236,8 @@ def _sanitize_rewards(rewards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 # Configuration
 # ==============================================================================
 # Environment
-env_cfg = OpenArmReachEnvCfg()
+USE_ERROR_OBS_EXPERIMENT = True
+env_cfg = OpenArmReachEnvCfgErrObs() if USE_ERROR_OBS_EXPERIMENT else OpenArmReachEnvCfg()
 env_cfg.scene.num_envs = 4096
 env_cfg.seed = 42
 env_cfg.sim.device = "cuda:0"
@@ -278,8 +280,8 @@ clip_param = 0.2          # value loss clip range
 
 # LR schedule (official repo: lr=3e-4, linear decay to 0)
 initial_lr = 1e-2
-final_lr = 3e-4
-lr_decay_iters = 500     # decay over full training (same as max_iterations)
+final_lr = 1e-3
+lr_decay_iters = 200     # decay over full training (same as max_iterations)
 
 # Network architecture — change these freely!
 actor_hidden_dims = [128, 128]

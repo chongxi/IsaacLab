@@ -8,6 +8,8 @@
 ##
 
 from isaaclab.utils import configclass
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import SceneEntityCfg
 
 import isaaclab_tasks.manager_based.manipulation.reach.mdp as mdp
 from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.reach_openarm_bi_env_cfg import ReachEnvCfg
@@ -80,3 +82,32 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
+
+
+@configclass
+class OpenArmReachEnvCfgErrObs(OpenArmReachEnvCfg):
+    """Experimental OpenArm Reach config with explicit EE error observations.
+
+    This keeps the baseline configuration intact and only changes policy observations
+    so the actor can consume direct task-space errors.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Replace pose-command observations with explicit EE pose error observations.
+        # Output is 6D: [pos_error(3), orientation_error_axis_angle(3)].
+        self.observations.policy.left_pose_command = ObsTerm(
+            func=mdp.ee_pose_command_error,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=["openarm_left_hand"]),
+                "command_name": "left_ee_pose",
+            },
+        )
+        self.observations.policy.right_pose_command = ObsTerm(
+            func=mdp.ee_pose_command_error,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=["openarm_right_hand"]),
+                "command_name": "right_ee_pose",
+            },
+        )

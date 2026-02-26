@@ -30,6 +30,7 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.joint_pos_env_cfg import (
     OpenArmReachEnvCfg,
+    OpenArmReachEnvCfgErrObs,
 )
 import isaaclab_tasks.manager_based.manipulation.reach.mdp as reach_mdp
 
@@ -115,7 +116,8 @@ def _flatten_obs(obs: TensorDict) -> torch.Tensor:
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_19-27-23/model_1250.pt"
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_21-40-37/model_1500.pt"
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-09-04/model_1500.pt"
-CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-26-40/model_1500.pt"
+# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-26-40/model_1500.pt"
+CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_23-14-01/model_1500.pt"
 
 # ==============================================================================
 # Network config — must match the training run that produced the checkpoint
@@ -128,7 +130,8 @@ INIT_NOISE_STD = 1.0
 # ==============================================================================
 # Environment
 # ==============================================================================
-env_cfg = OpenArmReachEnvCfg()
+USE_ERROR_OBS_EXPERIMENT = True
+env_cfg = OpenArmReachEnvCfgErrObs() if USE_ERROR_OBS_EXPERIMENT else OpenArmReachEnvCfg()
 env_cfg.scene.num_envs = 8
 env_cfg.seed = 42
 env_cfg.sim.device = "cuda:0"

@@ -11,7 +11,7 @@ import torch
 
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul
+from isaaclab.utils.math import combine_frame_transforms, compute_pose_error, quat_error_magnitude, quat_mul
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -99,6 +99,32 @@ def orientation_command_error_when_close(
     ori_error = quat_error_magnitude(curr_quat_w, des_quat_w)
 
     return torch.where(gate, ori_error, torch.zeros_like(ori_error))
+
+
+def ee_pose_command_error(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Explicit EE pose error w.r.t command: [position_error(3), orientation_error_axis_angle(3)].
+
+    This is useful as an observation term for policies that should consume direct
+    task-space errors.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    des_pos_b = command[:, :3]
+    des_quat_b = command[:, 3:7]
+    des_pos_w, des_quat_w = combine_frame_transforms(asset.data.root_pos_w, asset.data.root_quat_w, des_pos_b, des_quat_b)
+
+    curr_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids[0]]  # type: ignore
+    curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]  # type: ignore
+
+    pos_error, ori_error_axis_angle = compute_pose_error(
+        curr_pos_w,
+        curr_quat_w,
+        des_pos_w,
+        des_quat_w,
+        rot_error_type="axis_angle",
+    )
+    return torch.cat([pos_error, ori_error_axis_angle], dim=-1)
 
 
 def position_command_progress(
