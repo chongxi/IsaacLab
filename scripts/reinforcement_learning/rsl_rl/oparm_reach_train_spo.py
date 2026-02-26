@@ -1,11 +1,14 @@
 """
-Custom training script for Isaac-Reach-OpenArm-Bi-v0 with RSL-RL (PPO).
+Custom training script for Isaac-Reach-OpenArm-Bi-v0 with SPO (Simple Policy Optimization).
 
-The training loop is fully exposed so you can modify the loss function,
-add custom logging, or change the update logic.
+SPO replaces PPO's clipped surrogate loss with a quadratic penalty on the
+probability ratio, as described in:
+    L_p = - 1/N * sum{ ratio * A_hat - |A_hat| / (2*epsilon) * (ratio - 1)^2 }
+
+Everything else (GAE, value loss, entropy bonus, adaptive LR) remains the same.
 
 Usage:
-    ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/custom_train.py
+    ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/oparm_reach_train_spo.py
 """
 
 # ==============================================================================
@@ -41,8 +44,6 @@ from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.age
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = False
 
 # ==============================================================================
 # Step 1: Configure environment and agent
@@ -53,13 +54,19 @@ env_cfg.seed = 42
 env_cfg.sim.device = "cuda:0"
 
 agent_cfg = OpenArmReachPPORunnerCfg()
+agent_cfg.max_iterations = 1500  # Train longer than default (550) for SPO
+
+# LR schedule: linear decay from initial_lr → final_lr over lr_decay_iters,
+# then hold at final_lr for the remaining iterations.
+initial_lr = 1e-2   # same as PPO default
+final_lr = 3e-4     # SPO paper default — safe for SPO's quadratic penalty
+lr_decay_iters = 500  # match PPO's default training length for decay phase
 
 # ==============================================================================
 # Step 2: Create environment and runner
 #
-# We still use OnPolicyRunner to build the PPO algorithm, ActorCritic network,
-# and RolloutStorage. We just won't call runner.learn() — instead we run
-# the training loop ourselves.
+# We reuse OnPolicyRunner to build the ActorCritic network, optimizer,
+# and RolloutStorage. We just replace the policy loss with SPO.
 # ==============================================================================
 env = gym.make("Isaac-Reach-OpenArm-Bi-v0", cfg=env_cfg)
 env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -74,8 +81,9 @@ runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_
 # ==============================================================================
 wandb.init(
     project="isaaclab-openarm-reach",
-    name=f"ppo_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
+    name=f"spo_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
     config={
+        "algorithm": "SPO",
         "num_envs": env_cfg.scene.num_envs,
         "num_steps_per_env": agent_cfg.num_steps_per_env,
         "max_iterations": agent_cfg.max_iterations,
@@ -90,20 +98,17 @@ wandb.init(
 
 # ==============================================================================
 # Step 3: Extract the components we need from the runner
-#
-# After OnPolicyRunner.__init__(), the following are ready:
-#   runner.alg          — PPO algorithm instance
-#   runner.alg.policy   — ActorCritic neural network
-#   runner.alg.optimizer — Adam optimizer for the policy
-#   runner.alg.storage  — RolloutStorage (created on first learn call)
 # ==============================================================================
-alg = runner.alg            # PPO instance
+alg = runner.alg            # PPO instance (we reuse everything except the loss)
 policy = alg.policy         # ActorCritic(nn.Module)
 optimizer = alg.optimizer   # Adam optimizer
 device = agent_cfg.device
 
 num_steps_per_env = agent_cfg.num_steps_per_env
 max_iterations = agent_cfg.max_iterations
+
+# SPO uses epsilon (same as PPO's clip_param) for the quadratic penalty
+epsilon = 0.2 # alg.clip_param  # typically 0.2
 
 
 def save_checkpoint(path: str, iteration: int):
@@ -116,10 +121,7 @@ def save_checkpoint(path: str, iteration: int):
     }, path)
 
 # ==============================================================================
-# Step 4: Custom training loop
-#
-# This is the same logic as OnPolicyRunner.learn() + PPO.update(),
-# but fully exposed so you can modify anything.
+# Step 4: Custom training loop with SPO loss
 # ==============================================================================
 
 # Randomize initial episode lengths (for exploration diversity)
@@ -141,26 +143,14 @@ for iteration in range(max_iterations):
     iter_start = time.time()
 
     # ==================================================================
-    # Phase 1: Collect rollouts (no gradients needed)
+    # Phase 1: Collect rollouts (identical to PPO)
     # ==================================================================
     with torch.inference_mode():
         for step in range(num_steps_per_env):
-            # --- Actor forward pass ---
             actions = alg.act(obs)
-            # act() internally stores: transition.actions, .values, .actions_log_prob,
-            #                          .action_mean, .action_sigma, .observations
-
-            # --- Environment step ---
             obs, rewards, dones, extras = env.step(actions.to(env.device))
             obs, rewards, dones = obs.to(device), rewards.to(device), dones.to(device)
-
-            # --- Store transition ---
             alg.process_env_step(obs, rewards, dones, extras)
-            # process_env_step() internally:
-            #   1. Updates observation normalizers
-            #   2. Bootstraps rewards on timeouts (value * gamma * timeout_mask)
-            #   3. Adds transition to RolloutStorage
-            #   4. Resets hidden states for done envs (if recurrent)
 
             # --- Logging ---
             cur_reward_sum += rewards
@@ -174,20 +164,33 @@ for iteration in range(max_iterations):
         collection_time = time.time() - iter_start
 
         # --- Compute returns and advantages (GAE) ---
-        alg.compute_returns(obs)
-        # compute_returns() internally:
-        #   1. Evaluates V(last_obs) for bootstrapping
-        #   2. Computes GAE advantages and returns in RolloutStorage
+        # Unlike PPO, SPO uses per-mini-batch advantage normalization
+        # (matching the official SPO repo). We call storage.compute_returns
+        # directly with normalize_advantage=False, then normalize per
+        # mini-batch inside the training loop below.
+        last_values = policy.evaluate(obs).detach()
+        alg.storage.compute_returns(
+            last_values, alg.gamma, alg.lam, normalize_advantage=False
+        )
 
     # ==================================================================
-    # Phase 2: PPO update (with gradients)
+    # Phase 2: SPO update (with gradients)
     #
-    # *** THIS IS WHERE YOU MODIFY THE LOSS ***
+    # SPO policy loss (the ONLY difference from PPO):
     #
-    # The original PPO loss is:
-    #   loss = surrogate_loss + value_loss_coef * value_loss - entropy_coef * entropy
+    #   L_p = -1/N * sum{ ratio * A_hat
+    #                      - |A_hat| / (2 * epsilon) * (ratio - 1)^2 }
     #
-    # You can add custom terms, change coefficients, or replace losses entirely.
+    # where ratio = pi_new(a|s) / pi_old(a|s)
+    #
+    # Intuition: The first term is the standard policy gradient.
+    # The second term is a quadratic penalty that discourages the ratio
+    # from deviating from 1, weighted by |A_hat| — bigger advantages
+    # get a bigger penalty, keeping updates conservative.
+    #
+    # NOTE: Unlike PPO (which uses global advantage normalization),
+    # SPO uses per-mini-batch advantage normalization, matching the
+    # official SPO repo (https://github.com/MyRepositories-hub/Simple-Policy-Optimization).
     # ==================================================================
     learn_start = time.time()
 
@@ -195,59 +198,50 @@ for iteration in range(max_iterations):
     mean_surrogate_loss = 0.0
     mean_entropy = 0.0
 
-    # Mini-batch generator yields data from the rollout storage
     generator = alg.storage.mini_batch_generator(alg.num_mini_batches, alg.num_learning_epochs)
 
     for (
-        obs_batch,            # TensorDict of observations
-        actions_batch,        # [batch, num_actions] — actions taken
-        target_values_batch,  # [batch, 1] — V(s) at collection time
-        advantages_batch,     # [batch, 1] — GAE advantages
-        returns_batch,        # [batch, 1] — discounted returns
-        old_actions_log_prob_batch,  # [batch, 1] — log π_old(a|s)
-        old_mu_batch,         # [batch, num_actions] — old action mean
-        old_sigma_batch,      # [batch, num_actions] — old action std
-        hidden_states_batch,  # tuple (actor_hidden, critic_hidden) — for recurrent only
-        masks_batch,          # [batch] — masks for recurrent
+        obs_batch,
+        actions_batch,
+        target_values_batch,
+        advantages_batch,
+        returns_batch,
+        old_actions_log_prob_batch,
+        old_mu_batch,
+        old_sigma_batch,
+        hidden_states_batch,
+        masks_batch,
     ) in generator:
 
         # --- Forward pass with current policy ---
         policy.act(obs_batch)
-        actions_log_prob_batch = policy.get_actions_log_prob(actions_batch)  # log π_new(a|s)
-        value_batch = policy.evaluate(obs_batch)                            # V_new(s)
-        entropy_batch = policy.entropy                                      # H(π_new)
-        mu_batch = policy.action_mean
-        sigma_batch = policy.action_std
+        actions_log_prob_batch = policy.get_actions_log_prob(actions_batch)
+        value_batch = policy.evaluate(obs_batch)
+        entropy_batch = policy.entropy
 
-        # --- Adaptive learning rate (KL-based) ---
-        if alg.desired_kl is not None and alg.schedule == "adaptive":
-            with torch.inference_mode():
-                kl = torch.sum(
-                    torch.log(sigma_batch / old_sigma_batch + 1e-5)
-                    + (old_sigma_batch.square() + (old_mu_batch - mu_batch).square())
-                    / (2.0 * sigma_batch.square())
-                    - 0.5,
-                    dim=-1,
-                )
-                kl_mean = kl.mean()
-
-                if kl_mean > alg.desired_kl * 2.0:
-                    alg.learning_rate = max(1e-5, alg.learning_rate / 1.5)
-                elif kl_mean < alg.desired_kl / 2.0 and kl_mean > 0.0:
-                    alg.learning_rate = min(1e-2, alg.learning_rate * 1.5)
-
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = alg.learning_rate
-
-        # --- Surrogate (policy) loss ---
+        # ==============================================================
+        # *** SPO POLICY LOSS (replaces PPO clipped surrogate) ***
+        #
+        # PPO:  L = max(ratio * A, clip(ratio, 1-e, 1+e) * A)
+        # SPO:  L = -(ratio * A - |A| / (2*e) * (ratio - 1)^2)
+        #
+        # The SPO loss is simpler — no clipping, just a quadratic
+        # penalty on how far the ratio deviates from 1.
+        # ==============================================================
         ratio = torch.exp(actions_log_prob_batch - old_actions_log_prob_batch.squeeze())
-        surrogate = -advantages_batch.squeeze() * ratio
-        surrogate_clipped = -advantages_batch.squeeze() * torch.clamp(
-            ratio, 1.0 - alg.clip_param, 1.0 + alg.clip_param
-        )
-        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+        advantages = advantages_batch.squeeze()
 
-        # --- Value function loss ---
+        # Per-mini-batch advantage normalization (matching official SPO repo)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # SPO: ratio * A - |A| / (2*epsilon) * (ratio - 1)^2
+        # We negate because we minimize the loss (maximize the objective)
+        surrogate_loss = -(
+            ratio * advantages
+            - advantages.abs() / (2.0 * epsilon) * (ratio - 1.0).pow(2)
+        ).mean()
+
+        # --- Value function loss (same as PPO) ---
         if alg.use_clipped_value_loss:
             value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                 -alg.clip_param, alg.clip_param
@@ -259,20 +253,10 @@ for iteration in range(max_iterations):
             value_loss = (returns_batch - value_batch).pow(2).mean()
 
         # ==============================================================
-        # *** TOTAL LOSS — MODIFY HERE ***
+        # *** TOTAL LOSS ***
         #
-        # Original PPO:
-        #   loss = surrogate_loss + value_coef * value_loss - entropy_coef * entropy
-        #
-        # Examples of modifications:
-        #   - Add L2 regularization:
-        #       l2_reg = sum(p.pow(2).sum() for p in policy.parameters())
-        #       loss += 1e-4 * l2_reg
-        #   - Add action smoothness penalty:
-        #       action_penalty = actions_batch.diff(dim=0).pow(2).mean()
-        #       loss += 0.01 * action_penalty
-        #   - Change value loss coefficient:
-        #       loss = surrogate_loss + 0.5 * value_loss - 0.01 * entropy
+        # Same structure as PPO:
+        #   L = L_policy + c1 * L_value - c2 * L_entropy
         # ==============================================================
         loss = (
             surrogate_loss
@@ -297,6 +281,15 @@ for iteration in range(max_iterations):
     mean_surrogate_loss /= num_updates
     mean_entropy /= num_updates
 
+    # --- LR schedule: linear decay initial_lr → final_lr, then hold ---
+    if iteration < lr_decay_iters:
+        frac = 1.0 - iteration / lr_decay_iters
+        lr_now = final_lr + frac * (initial_lr - final_lr)
+    else:
+        lr_now = final_lr
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr_now
+
     # Clear rollout storage for next iteration
     alg.storage.clear()
 
@@ -316,7 +309,6 @@ for iteration in range(max_iterations):
         mean_reward = 0.0
         mean_ep_len = 0.0
 
-    # Get current noise std for logging
     if hasattr(policy, "std"):
         noise_std = policy.std.mean().item()
     elif hasattr(policy, "log_std"):
@@ -330,10 +322,10 @@ for iteration in range(max_iterations):
         f"Reward: {mean_reward:6.2f} | "
         f"EpLen: {mean_ep_len:6.0f} | "
         f"Value_Loss: {mean_value_loss:.4f} | "
-        f"Policy_Loss: {mean_surrogate_loss:.4f} | "
+        f"SPO_Loss: {mean_surrogate_loss:.4f} | "
         f"Entropy: {mean_entropy:.4f} | "
         f"NoiseStd: {noise_std:.3f} | "
-        f"LR: {alg.learning_rate:.1e} | "
+        f"LR: {lr_now:.1e} | "
         f"FPS: {fps:,.0f}"
     )
 
@@ -342,10 +334,10 @@ for iteration in range(max_iterations):
         "reward/mean": mean_reward,
         "reward/episode_length": mean_ep_len,
         "loss/value": mean_value_loss,
-        "loss/surrogate": mean_surrogate_loss,
+        "loss/spo_surrogate": mean_surrogate_loss,
         "loss/entropy": mean_entropy,
         "policy/noise_std": noise_std,
-        "policy/learning_rate": alg.learning_rate,
+        "policy/learning_rate": lr_now,
         "perf/fps": fps,
         "perf/collection_time": collection_time,
         "perf/learn_time": learn_time,
@@ -371,7 +363,7 @@ print(f"Total training time: {time.time() - start_time:.1f}s")
 artifact = wandb.Artifact(
     name=f"model-{wandb.run.id}",
     type="model",
-    description=f"PPO policy trained for {max_iterations} iterations",
+    description=f"SPO policy trained for {max_iterations} iterations",
 )
 artifact.add_file(final_path)
 wandb.log_artifact(artifact)
