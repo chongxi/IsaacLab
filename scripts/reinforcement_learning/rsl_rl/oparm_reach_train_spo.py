@@ -64,7 +64,7 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.
     return layer
 
 
-class ActorCritic(nn.Module):
+class ActorCritic_MLP(nn.Module):
     """Gaussian actor-critic with separate actor and critic networks."""
 
     is_recurrent = False
@@ -167,6 +167,147 @@ class ActorCritic(nn.Module):
         return self._distribution.log_prob(actions).sum(dim=-1)
 
 
+class ActorCritic_NEW(nn.Module):
+    """Structured actor-critic: context -> matrix, then matrix @ error -> action mean."""
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        num_obs: int,
+        num_actions: int,
+        actor_hidden_dims: list[int] = [64, 64],
+        critic_hidden_dims: list[int] = [64, 64],
+        activation: str = "tanh",
+        init_noise_std: float = 1.0,
+    ):
+        super().__init__()
+
+        if num_actions % 2 != 0:
+            raise ValueError(f"Expected even number of actions (bimanual), got {num_actions}.")
+
+        self.dof_per_arm = num_actions // 2
+        self.err_dim_per_arm = 6
+        self.expected_obs_dim = 6 * self.dof_per_arm + 2 * self.err_dim_per_arm
+        if num_obs != self.expected_obs_dim:
+            raise ValueError(
+                "ActorCritic_NEW expects explicit error observation layout "
+                "[l_q, r_q, l_dq, r_dq, l_err6, r_err6, l_prev_a, r_prev_a]. "
+                f"Got num_obs={num_obs}, expected={self.expected_obs_dim}."
+            )
+
+        activations = {
+            "elu": nn.ELU,
+            "relu": nn.ReLU,
+            "tanh": nn.Tanh,
+            "leaky_relu": nn.LeakyReLU,
+            "selu": nn.SELU,
+            "gelu": nn.GELU,
+        }
+        act_fn = activations[activation]
+
+        # Transformer-style dynamic pseudo-Jacobian from (q, dq) only:
+        # A = a_scale * (Q(q,dq) @ K(q,dq)^T / sqrt(d)),  u = A @ e
+        attn_dim = actor_hidden_dims[0] if len(actor_hidden_dims) > 0 else 64
+        self.joint_query = layer_init(nn.Linear(2, attn_dim), std=0.01)
+        self.arm_key = layer_init(nn.Linear(2 * self.dof_per_arm, self.err_dim_per_arm * attn_dim), std=0.01)
+        self.joint_id_embed = nn.Parameter(torch.zeros(self.dof_per_arm, attn_dim))
+        nn.init.normal_(self.joint_id_embed, mean=0.0, std=0.02)
+        self.attn_scale = float(attn_dim) ** -0.5
+        self.a_scale = nn.Parameter(torch.ones(self.dof_per_arm, self.err_dim_per_arm))
+
+        # Critic remains standard MLP on full observation
+        critic_layers = []
+        in_dim = num_obs
+        for h_dim in critic_hidden_dims:
+            critic_layers.append(layer_init(nn.Linear(in_dim, h_dim)))
+            critic_layers.append(act_fn())
+            in_dim = h_dim
+        critic_layers.append(layer_init(nn.Linear(in_dim, 1), std=1.0))
+        self.critic = nn.Sequential(*critic_layers)
+
+        self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(1, num_actions)))
+        self._distribution: Normal | None = None
+        Normal.set_default_validate_args(False)
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        return self.log_std.exp()
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        return self._distribution.mean
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        return self._distribution.entropy().sum(dim=-1)
+
+    def _split_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = self.dof_per_arm
+        # [l_q, r_q, l_dq, r_dq, l_err6, r_err6, l_prev_a, r_prev_a]
+        left_q = obs[:, 0:n]
+        right_q = obs[:, n:2 * n]
+        left_dq = obs[:, 2 * n:3 * n]
+        right_dq = obs[:, 3 * n:4 * n]
+        left_err = obs[:, 4 * n:4 * n + self.err_dim_per_arm]
+        right_err = obs[:, 4 * n + self.err_dim_per_arm:4 * n + 2 * self.err_dim_per_arm]
+        return left_q, right_q, left_dq, right_dq, left_err, right_err
+
+    def _actor_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        left_q, right_q, left_dq, right_dq, left_err, right_err = self._split_obs(obs)
+
+        # per-joint tokens: [q_i, dq_i] -> query_i
+        left_joint_tokens = torch.stack([left_q, left_dq], dim=-1)   # [B, n, 2]
+        right_joint_tokens = torch.stack([right_q, right_dq], dim=-1)  # [B, n, 2]
+        left_query = self.joint_query(left_joint_tokens)   # [B, n, d]
+        right_query = self.joint_query(right_joint_tokens)  # [B, n, d]
+        joint_bias = self.joint_id_embed.unsqueeze(0)  # [1, n, d]
+        left_query = left_query + joint_bias
+        right_query = right_query + joint_bias
+
+        # state-dependent keys K(q,dq) per arm: [B, 6, d]
+        left_state = torch.cat([left_q, left_dq], dim=-1)
+        right_state = torch.cat([right_q, right_dq], dim=-1)
+        left_key = self.arm_key(left_state).view(-1, self.err_dim_per_arm, left_query.shape[-1])
+        right_key = self.arm_key(right_state).view(-1, self.err_dim_per_arm, right_query.shape[-1])
+
+        # dynamic linear pseudo-Jacobian A from q,dq using Q(q,dq) and K(q,dq)
+        left_logits = torch.einsum("bnd,bmd->bnm", left_query, left_key) * self.attn_scale
+        right_logits = torch.einsum("bnd,bmd->bnm", right_query, right_key) * self.attn_scale
+        a_scale = self.a_scale.unsqueeze(0)  # [1, n, 6]
+        left_A = a_scale * left_logits    # [B, n, 6]
+        right_A = a_scale * right_logits  # [B, n, 6]
+
+        left_u = torch.bmm(left_A, left_err.unsqueeze(-1)).squeeze(-1)
+        right_u = torch.bmm(right_A, right_err.unsqueeze(-1)).squeeze(-1)
+        u = torch.cat([left_u, right_u], dim=-1)
+        # u = torch.tanh(u)  # Ensure mean actions are in [-1, 1]; remove if not needed
+        return u
+
+    def forward_actor(self, obs: torch.Tensor) -> Normal:
+        mean = self._actor_mean(obs)
+        log_std = self.log_std.clamp(-20.0, 2.0)
+        std = log_std.exp().expand_as(mean)
+        self._distribution = Normal(mean, std)
+        return self._distribution
+
+    def forward_critic(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(obs)
+
+    def act(self, obs: torch.Tensor) -> torch.Tensor:
+        dist = self.forward_actor(obs)
+        return dist.sample()
+
+    def act_inference(self, obs: torch.Tensor) -> torch.Tensor:
+        return self._actor_mean(obs)
+
+    def evaluate(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.forward_critic(obs)
+
+    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._distribution.log_prob(actions).sum(dim=-1)
+
+
 def _flatten_obs(obs: TensorDict) -> torch.Tensor:
     """Extract the flat observation tensor from a TensorDict.
 
@@ -248,14 +389,14 @@ env_cfg.sim.device = "cuda:0"
 env_cfg.actions.left_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
     asset_name="robot",
     joint_names=["openarm_left_joint.*"],
-    scale=0.3,
+    scale=0.5,
     use_zero_offset=True,
     alpha=0.3,
 )
 env_cfg.actions.right_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
     asset_name="robot",
     joint_names=["openarm_right_joint.*"],
-    scale=0.3,
+    scale=0.5,
     use_zero_offset=True,
     alpha=0.3,
 )
@@ -288,6 +429,7 @@ actor_hidden_dims = [128, 128]
 critic_hidden_dims = [64, 64]
 activation = "elu"       # official SPO repo uses Tanh
 init_noise_std = 1.0
+policy_class_name = "new"  # "mlp" or "new"
 
 # ==============================================================================
 # Step 1: Create environment
@@ -310,7 +452,13 @@ num_actions = env.num_actions
 print(f"Observation dim: {num_obs}, Action dim: {num_actions}")
 
 # Create our custom network
-policy = ActorCritic(
+policy_class_map = {
+    "mlp": ActorCritic_MLP,
+    "new": ActorCritic_NEW,
+}
+policy_cls = policy_class_map[policy_class_name.lower()]
+
+policy = policy_cls(
     num_obs=num_obs,
     num_actions=num_actions,
     actor_hidden_dims=actor_hidden_dims,
@@ -319,7 +467,10 @@ policy = ActorCritic(
     init_noise_std=init_noise_std,
 ).to(device)
 
-print(f"Actor:  {policy.actor}")
+if hasattr(policy, "actor"):
+    print(f"Actor:  {policy.actor}")
+else:
+    print(f"Actor:  {policy.__class__.__name__} (structured)")
 print(f"Critic: {policy.critic}")
 print(f"Total parameters: {sum(p.numel() for p in policy.parameters()):,}")
 
@@ -363,6 +514,7 @@ wandb.init(
         "max_grad_norm": max_grad_norm,
         "value_loss_coef": value_loss_coef,
         "entropy_coef": entropy_coef,
+        "policy_class_name": policy_class_name,
     },
     dir=log_dir,
     save_code=True,
