@@ -35,12 +35,14 @@ class OpenArmReachEnvCfg(ReachEnvCfg):
         self.rewards.left_end_effector_position_tracking_fine_grained.params["asset_cfg"].body_names = [
             "openarm_left_hand"
         ]
+        self.rewards.left_end_effector_position_progress.params["asset_cfg"].body_names = ["openarm_left_hand"]
         self.rewards.left_end_effector_orientation_tracking.params["asset_cfg"].body_names = ["openarm_left_hand"]
 
         self.rewards.right_end_effector_position_tracking.params["asset_cfg"].body_names = ["openarm_right_hand"]
         self.rewards.right_end_effector_position_tracking_fine_grained.params["asset_cfg"].body_names = [
             "openarm_right_hand"
         ]
+        self.rewards.right_end_effector_position_progress.params["asset_cfg"].body_names = ["openarm_right_hand"]
         self.rewards.right_end_effector_orientation_tracking.params["asset_cfg"].body_names = ["openarm_right_hand"]
 
         # override actions

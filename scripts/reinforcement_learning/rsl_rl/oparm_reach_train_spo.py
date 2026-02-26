@@ -42,6 +42,7 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.joint_pos_env_cfg import (
     OpenArmReachEnvCfg,
 )
+import isaaclab_tasks.manager_based.manipulation.reach.mdp as reach_mdp
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -98,6 +99,7 @@ class ActorCritic(nn.Module):
             actor_layers.append(act_fn())
             in_dim = h_dim
         actor_layers.append(layer_init(nn.Linear(in_dim, num_actions), std=0.01))
+        actor_layers.append(nn.Tanh())  # Assuming actions are in [-1, 1]; remove if not needed
         self.actor = nn.Sequential(*actor_layers)
 
         # --- Critic network: obs → V(s) ---
@@ -191,6 +193,44 @@ def _flatten_obs(obs: TensorDict) -> torch.Tensor:
     return torch.cat(tensors, dim=-1)
 
 
+def _row_is_finite(x: torch.Tensor) -> torch.Tensor:
+    """Return per-env finite mask for tensor shaped [num_envs, ...]."""
+    if not torch.is_floating_point(x):
+        return torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+    return torch.isfinite(x.reshape(x.shape[0], -1)).all(dim=-1)
+
+
+def _sanitize_policy_obs(obs: TensorDict) -> tuple[TensorDict, torch.Tensor]:
+    """Sanitize policy observations and return invalid env mask."""
+    obs_flat = _flatten_obs(obs)
+    invalid_env = ~_row_is_finite(obs_flat)
+
+    if invalid_env.any() and "policy" in obs.keys() and isinstance(obs["policy"], torch.Tensor):
+        policy_obs = torch.nan_to_num(obs["policy"], nan=0.0, posinf=0.0, neginf=0.0)
+        policy_obs[invalid_env] = 0.0
+        obs["policy"] = policy_obs
+
+    return obs, invalid_env
+
+
+def _sanitize_actions(actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sanitize sampled actions and return invalid env mask."""
+    invalid_env = ~_row_is_finite(actions)
+    if invalid_env.any():
+        actions = torch.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0)
+        actions[invalid_env] = 0.0
+    return actions, invalid_env
+
+
+def _sanitize_rewards(rewards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sanitize rewards and return invalid env mask."""
+    invalid_env = ~_row_is_finite(rewards)
+    if invalid_env.any():
+        rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        rewards[invalid_env] = 0.0
+    return rewards, invalid_env
+
+
 # ==============================================================================
 # Configuration
 # ==============================================================================
@@ -199,6 +239,24 @@ env_cfg = OpenArmReachEnvCfg()
 env_cfg.scene.num_envs = 4096
 env_cfg.seed = 42
 env_cfg.sim.device = "cuda:0"
+
+# Use relative joint position actions (delta command) for stability.
+# With tanh actor head, raw action is approximately in [-1, 1], so the effective
+# joint delta per step is scale * action.
+env_cfg.actions.left_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
+    asset_name="robot",
+    joint_names=["openarm_left_joint.*"],
+    scale=0.3,
+    use_zero_offset=True,
+    alpha=0.3,
+)
+env_cfg.actions.right_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
+    asset_name="robot",
+    joint_names=["openarm_right_joint.*"],
+    scale=0.3,
+    use_zero_offset=True,
+    alpha=0.3,
+)
 device = "cuda:0"
 
 # Training
@@ -210,7 +268,7 @@ save_interval = 50
 epsilon = 0.2             # quadratic penalty coefficient
 gamma = 0.99              # discount factor
 lam = 0.95                # GAE lambda
-value_loss_coef = 0.5     # critic loss weight (official repo: c_1=0.5)
+value_loss_coef = 1.0     # critic loss weight (official repo: c_1=0.5)
 entropy_coef = 0.001      # entropy bonus (official MuJoCo repo: c_2=0.0)
 max_grad_norm = 1.0       # gradient clipping (official repo: 0.5)
 num_learning_epochs = 8   # SGD epochs per iteration (official repo: update_epochs=10)
@@ -224,7 +282,7 @@ final_lr = 3e-4
 lr_decay_iters = 500     # decay over full training (same as max_iterations)
 
 # Network architecture — change these freely!
-actor_hidden_dims = [64, 64]
+actor_hidden_dims = [128, 128]
 critic_hidden_dims = [64, 64]
 activation = "elu"       # official SPO repo uses Tanh
 init_noise_std = 1.0
@@ -233,7 +291,7 @@ init_noise_std = 1.0
 # Step 1: Create environment
 # ==============================================================================
 env = gym.make("Isaac-Reach-OpenArm-Bi-v0", cfg=env_cfg)
-env = RslRlVecEnvWrapper(env, clip_actions=None)
+env = RslRlVecEnvWrapper(env, clip_actions=1.0)
 
 log_dir = os.path.join("logs", "rsl_rl", "openarm_bi_reach", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 os.makedirs(log_dir, exist_ok=True)
@@ -264,7 +322,7 @@ print(f"Critic: {policy.critic}")
 print(f"Total parameters: {sum(p.numel() for p in policy.parameters()):,}")
 
 # Optimizer
-optimizer = torch.optim.Adam(policy.parameters(), lr=initial_lr)
+optimizer = torch.optim.AdamW(policy.parameters(), lr=initial_lr)
 
 # Rollout storage (reuse RSL-RL's GAE computation)
 storage = RolloutStorage(
@@ -335,18 +393,22 @@ start_time = time.time()
 
 for iteration in range(max_iterations):
     iter_start = time.time()
+    forced_done_count = 0
 
     # ==================================================================
     # Phase 1: Collect rollouts
     # ==================================================================
     with torch.inference_mode():
         for step in range(num_steps_per_env):
+            obs_td, invalid_obs_before = _sanitize_policy_obs(obs_td)
             obs_flat = _flatten_obs(obs_td)
 
             # Forward pass through our custom network
             actions = policy.act(obs_flat)
+            actions, invalid_actions = _sanitize_actions(actions)
             values = policy.evaluate(obs_flat)
             log_probs = policy.get_actions_log_prob(actions)
+            invalid_now = invalid_obs_before | invalid_actions
 
             # Store transition (RolloutStorage interface)
             transition.observations = obs_td
@@ -361,6 +423,17 @@ for iteration in range(max_iterations):
             obs_td = obs_td.to(device)
             rewards = rewards.to(device)
             dones = dones.to(device)
+
+            obs_td, invalid_obs_after = _sanitize_policy_obs(obs_td)
+            rewards, invalid_rewards = _sanitize_rewards(rewards)
+            invalid_env = invalid_now | invalid_obs_after | invalid_rewards
+            if invalid_env.any():
+                forced_done_count += int(invalid_env.sum().item())
+                if dones.ndim > 1:
+                    dones[invalid_env] = 1
+                else:
+                    dones[invalid_env] = True
+                rewards[invalid_env] = 0.0
 
             # Bootstrap on time-outs (so truncation != termination)
             transition.rewards = rewards.clone()
@@ -402,6 +475,7 @@ for iteration in range(max_iterations):
     mean_value_loss = 0.0
     mean_surrogate_loss = 0.0
     mean_entropy = 0.0
+    dropped_minibatch_samples = 0
 
     generator = storage.mini_batch_generator(num_mini_batches, num_learning_epochs)
 
@@ -417,17 +491,47 @@ for iteration in range(max_iterations):
         hidden_states_batch,
         masks_batch,
     ) in generator:
+        obs_flat_batch = _flatten_obs(obs_batch)
+
+        valid_rows = (
+            _row_is_finite(obs_flat_batch)
+            & _row_is_finite(actions_batch)
+            & _row_is_finite(target_values_batch)
+            & _row_is_finite(advantages_batch)
+            & _row_is_finite(returns_batch)
+            & _row_is_finite(old_actions_log_prob_batch)
+        )
+
+        if not torch.any(valid_rows):
+            dropped_minibatch_samples += int(valid_rows.numel())
+            continue
+
+        dropped_minibatch_samples += int((~valid_rows).sum().item())
+        obs_flat_batch = obs_flat_batch[valid_rows]
+        actions_batch = actions_batch[valid_rows]
+        target_values_batch = target_values_batch[valid_rows]
+        advantages_batch = advantages_batch[valid_rows]
+        returns_batch = returns_batch[valid_rows]
+        old_actions_log_prob_batch = old_actions_log_prob_batch[valid_rows]
 
         # Forward pass through our custom network
-        obs_flat_batch = _flatten_obs(obs_batch)
         policy.forward_actor(obs_flat_batch)
         actions_log_prob_batch = policy.get_actions_log_prob(actions_batch)
         value_batch = policy.evaluate(obs_flat_batch)
         entropy_batch = policy.entropy
 
+        if not (
+            torch.isfinite(actions_log_prob_batch).all()
+            and torch.isfinite(value_batch).all()
+            and torch.isfinite(entropy_batch).all()
+        ):
+            continue
+
         # --- SPO policy loss ---
-        ratio = torch.exp(actions_log_prob_batch - old_actions_log_prob_batch.squeeze())
-        advantages = advantages_batch.squeeze()
+        log_ratio = actions_log_prob_batch - old_actions_log_prob_batch.squeeze(-1)
+        log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+        ratio = torch.exp(log_ratio)
+        advantages = advantages_batch.squeeze(-1)
 
         # Per-mini-batch advantage normalization
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -451,11 +555,21 @@ for iteration in range(max_iterations):
         # --- Total loss ---
         loss = surrogate_loss + value_loss_coef * value_loss - entropy_coef * entropy_batch.mean()
 
+        if not torch.isfinite(loss):
+            continue
+
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+        if not torch.isfinite(grad_norm):
+            optimizer.zero_grad(set_to_none=True)
+            continue
         optimizer.step()
+
+        with torch.no_grad():
+            policy.log_std.data.nan_to_num_(nan=0.0, posinf=2.0, neginf=-20.0)
+            policy.log_std.data.clamp_(-20.0, 2.0)
 
         mean_value_loss += value_loss.item()
         mean_surrogate_loss += surrogate_loss.item()
@@ -498,7 +612,9 @@ for iteration in range(max_iterations):
         f"Entropy: {mean_entropy:.4f} | "
         f"NoiseStd: {noise_std:.3f} | "
         f"LR: {lr_now:.1e} | "
-        f"FPS: {fps:,.0f}"
+        f"FPS: {fps:,.0f} | "
+        f"ForcedDone: {forced_done_count} | "
+        f"Dropped: {dropped_minibatch_samples}"
     )
 
     wandb.log({
@@ -513,6 +629,8 @@ for iteration in range(max_iterations):
         "perf/collection_time": collection_time,
         "perf/learn_time": learn_time,
         "perf/iter_time": iter_time,
+        "debug/forced_done_count": forced_done_count,
+        "debug/dropped_minibatch_samples": dropped_minibatch_samples,
         "train/total_steps": total_steps,
     }, step=iteration)
 

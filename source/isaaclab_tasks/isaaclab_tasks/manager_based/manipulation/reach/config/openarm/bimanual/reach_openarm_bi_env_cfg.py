@@ -230,6 +230,24 @@ class RewardsCfg:
         },
     )
 
+    left_end_effector_position_progress = RewTerm(
+        func=mdp.position_command_progress,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
+            "command_name": "left_ee_pose",
+        },
+    )
+
+    right_end_effector_position_progress = RewTerm(
+        func=mdp.position_command_progress,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
+            "command_name": "right_ee_pose",
+        },
+    )
+
     left_end_effector_orientation_tracking = RewTerm(
         func=mdp.orientation_command_error,
         weight=-0.2,
@@ -247,6 +265,26 @@ class RewardsCfg:
             "command_name": "right_ee_pose",
         },
     )
+
+    # left_end_effector_orientation_tracking = RewTerm(
+    #     func=mdp.orientation_command_error_when_close,
+    #     weight=-0.5,
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
+    #         "command_name": "left_ee_pose",
+    #         "position_threshold": 0.10,
+    #     },
+    # )
+
+    # right_end_effector_orientation_tracking = RewTerm(
+    #     func=mdp.orientation_command_error_when_close,
+    #     weight=-0.5,
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
+    #         "command_name": "right_ee_pose",
+    #         "position_threshold": 0.10,
+    #     },
+    # )
 
     # action penalty
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.0001)

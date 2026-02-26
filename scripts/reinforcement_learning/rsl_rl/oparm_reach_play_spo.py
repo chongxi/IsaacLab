@@ -31,6 +31,7 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.joint_pos_env_cfg import (
     OpenArmReachEnvCfg,
 )
+import isaaclab_tasks.manager_based.manipulation.reach.mdp as reach_mdp
 
 # ==============================================================================
 # Custom ActorCritic (must match the training script exactly)
@@ -68,6 +69,7 @@ class ActorCritic(nn.Module):
             actor_layers.append(act_fn())
             in_dim = h_dim
         actor_layers.append(layer_init(nn.Linear(in_dim, num_actions), std=0.01))
+        actor_layers.append(nn.Tanh())
         self.actor = nn.Sequential(*actor_layers)
 
         # Critic
@@ -110,12 +112,15 @@ def _flatten_obs(obs: TensorDict) -> torch.Tensor:
 # ==============================================================================
 # Checkpoint — update this path to the checkpoint you want to play
 # ==============================================================================
-CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_19-27-23/model_1250.pt"
+# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_19-27-23/model_1250.pt"
+# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_21-40-37/model_1500.pt"
+# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-09-04/model_1500.pt"
+CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-26-40/model_1500.pt"
 
 # ==============================================================================
 # Network config — must match the training run that produced the checkpoint
 # ==============================================================================
-ACTOR_HIDDEN_DIMS = [64, 64]
+ACTOR_HIDDEN_DIMS = [128, 128]
 CRITIC_HIDDEN_DIMS = [64, 64]
 ACTIVATION = "elu"
 INIT_NOISE_STD = 1.0
@@ -128,8 +133,24 @@ env_cfg.scene.num_envs = 8
 env_cfg.seed = 42
 env_cfg.sim.device = "cuda:0"
 
+# Match training-time action interface (relative joint position / delta action).
+env_cfg.actions.left_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
+    asset_name="robot",
+    joint_names=["openarm_left_joint.*"],
+    scale=0.3,
+    use_zero_offset=True,
+    alpha=0.3,
+)
+env_cfg.actions.right_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
+    asset_name="robot",
+    joint_names=["openarm_right_joint.*"],
+    scale=0.3,
+    use_zero_offset=True,
+    alpha=0.3,
+)
+
 env = gym.make("Isaac-Reach-OpenArm-Bi-v0", cfg=env_cfg)
-env = RslRlVecEnvWrapper(env, clip_actions=None)
+env = RslRlVecEnvWrapper(env, clip_actions=1.0)
 
 # ==============================================================================
 # Build policy and load checkpoint

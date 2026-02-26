@@ -68,3 +68,87 @@ def orientation_command_error(env: ManagerBasedRLEnv, command_name: str, asset_c
     des_quat_w = quat_mul(asset.data.root_quat_w, des_quat_b)
     curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]  # type: ignore
     return quat_error_magnitude(curr_quat_w, des_quat_w)
+
+
+def orientation_command_error_when_close(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    position_threshold: float,
+) -> torch.Tensor:
+    """Penalize orientation error only when position error is within a threshold.
+
+    If the end-effector position error is larger than ``position_threshold``, this
+    term returns zero for that environment.
+    """
+    # extract the asset
+    asset: RigidObject = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    # position error gate
+    des_pos_b = command[:, :3]
+    des_pos_w, _ = combine_frame_transforms(asset.data.root_pos_w, asset.data.root_quat_w, des_pos_b)
+    curr_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids[0]]  # type: ignore
+    pos_error = torch.norm(curr_pos_w - des_pos_w, dim=1)
+    gate = pos_error <= position_threshold
+
+    # orientation error
+    des_quat_b = command[:, 3:7]
+    des_quat_w = quat_mul(asset.data.root_quat_w, des_quat_b)
+    curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]  # type: ignore
+    ori_error = quat_error_magnitude(curr_quat_w, des_quat_w)
+
+    return torch.where(gate, ori_error, torch.zeros_like(ori_error))
+
+
+def position_command_progress(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Reward progress in position tracking error (previous distance minus current distance).
+
+    Positive value means the end-effector moved closer to the commanded target
+    in this step. Negative value means it moved farther away.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    des_pos_b = command[:, :3]
+    des_pos_w, _ = combine_frame_transforms(asset.data.root_pos_w, asset.data.root_quat_w, des_pos_b)
+    curr_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids[0]]  # type: ignore
+    curr_dist = torch.norm(curr_pos_w - des_pos_w, dim=1)
+
+    prev_dist_cache = getattr(env, "_position_progress_prev_dist", None)
+    if prev_dist_cache is None:
+        prev_dist_cache = {}
+        setattr(env, "_position_progress_prev_dist", prev_dist_cache)
+
+    prev_cmd_cache = getattr(env, "_position_progress_prev_cmd", None)
+    if prev_cmd_cache is None:
+        prev_cmd_cache = {}
+        setattr(env, "_position_progress_prev_cmd", prev_cmd_cache)
+
+    cache_key = f"{asset_cfg.name}:{asset_cfg.body_ids}:{command_name}"
+    prev_dist = prev_dist_cache.get(cache_key)
+    prev_cmd = prev_cmd_cache.get(cache_key)
+    if prev_dist is None:
+        prev_dist = curr_dist.clone()
+    if prev_cmd is None:
+        prev_cmd = des_pos_b.detach().clone()
+
+    progress = prev_dist - curr_dist
+
+    # Reset progress at command resampling boundaries to avoid artificial spikes
+    # from target jumps (not due to robot motion).
+    cmd_changed = (des_pos_b - prev_cmd).abs().max(dim=1).values > 1e-6
+
+    if hasattr(env, "episode_length_buf"):
+        is_new_episode = env.episode_length_buf == 0
+        progress = torch.where(is_new_episode | cmd_changed, torch.zeros_like(progress), progress)
+    else:
+        progress = torch.where(cmd_changed, torch.zeros_like(progress), progress)
+
+    prev_dist_cache[cache_key] = curr_dist.detach().clone()
+    prev_cmd_cache[cache_key] = des_pos_b.detach().clone()
+    return progress
