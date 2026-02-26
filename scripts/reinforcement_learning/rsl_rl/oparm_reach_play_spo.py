@@ -174,8 +174,8 @@ class ActorCritic_NEW(nn.Module):
         left_logits = torch.einsum("bnd,bmd->bnm", left_query, left_key) * self.attn_scale
         right_logits = torch.einsum("bnd,bmd->bnm", right_query, right_key) * self.attn_scale
         a_scale = self.a_scale.unsqueeze(0)
-        left_A = a_scale * left_logits
-        right_A = a_scale * right_logits
+        left_A = left_logits
+        right_A = right_logits
 
         left_u = torch.bmm(left_A, left_err.unsqueeze(-1)).squeeze(-1)
         right_u = torch.bmm(right_A, right_err.unsqueeze(-1)).squeeze(-1)
@@ -213,12 +213,14 @@ def _flatten_obs(obs: TensorDict) -> torch.Tensor:
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-09-04/model_1500.pt"
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-26-40/model_1500.pt"
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_23-14-01/model_1500.pt"
-CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-26_00-23-54/model_1500.pt"
+# CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-26_09-35-12/model_1500.pt"
+# CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-26_12-27-19/model_1500.pt"
+CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-26_14-09-34/model_1500.pt"
 
 # ==============================================================================
 # Network config — must match the training run that produced the checkpoint
 # ==============================================================================
-ACTOR_HIDDEN_DIMS = [128, 128]
+ACTOR_HIDDEN_DIMS = [64, 64]
 CRITIC_HIDDEN_DIMS = [64, 64]
 ACTIVATION = "elu"
 INIT_NOISE_STD = 1.0

@@ -275,8 +275,11 @@ class ActorCritic_NEW(nn.Module):
         left_logits = torch.einsum("bnd,bmd->bnm", left_query, left_key) * self.attn_scale
         right_logits = torch.einsum("bnd,bmd->bnm", right_query, right_key) * self.attn_scale
         a_scale = self.a_scale.unsqueeze(0)  # [1, n, 6]
-        left_A = a_scale * left_logits    # [B, n, 6]
-        right_A = a_scale * right_logits  # [B, n, 6]
+        left_A = left_logits # a_scale * left_logits    # [B, n, 6]
+        right_A = right_logits # a_scale * right_logits   # [B, n, 6]
+        # experiment: softmax over error dims so each joint's weights sum to 1 (yes, this breaks learning)
+        # left_A = torch.softmax(left_logits, dim=-1)    # [B, n, 6]
+        # right_A = torch.softmax(right_logits, dim=-1)  # [B, n, 6]
 
         left_u = torch.bmm(left_A, left_err.unsqueeze(-1)).squeeze(-1)
         right_u = torch.bmm(right_A, right_err.unsqueeze(-1)).squeeze(-1)
@@ -391,14 +394,14 @@ env_cfg.actions.left_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
     joint_names=["openarm_left_joint.*"],
     scale=0.5,
     use_zero_offset=True,
-    alpha=0.3,
+    alpha=0.7,
 )
 env_cfg.actions.right_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
     asset_name="robot",
     joint_names=["openarm_right_joint.*"],
     scale=0.5,
     use_zero_offset=True,
-    alpha=0.3,
+    alpha=0.7,
 )
 device = "cuda:0"
 
@@ -418,14 +421,15 @@ num_learning_epochs = 8   # SGD epochs per iteration (official repo: update_epoc
 num_mini_batches = 4      # mini-batches per epoch
 use_clipped_value_loss = True
 clip_param = 0.2          # value loss clip range
+target_kl = 0.02          # KL early stopping threshold (None to disable)
 
 # LR schedule (official repo: lr=3e-4, linear decay to 0)
 initial_lr = 1e-2
-final_lr = 1e-3
-lr_decay_iters = 200     # decay over full training (same as max_iterations)
+final_lr = 3e-5 # 1e-3
+lr_decay_iters = 1000 # 200     # decay over full training (same as max_iterations)
 
 # Network architecture — change these freely!
-actor_hidden_dims = [128, 128]
+actor_hidden_dims = [64, 64]
 critic_hidden_dims = [64, 64]
 activation = "elu"       # official SPO repo uses Tanh
 init_noise_std = 1.0
@@ -514,6 +518,7 @@ wandb.init(
         "max_grad_norm": max_grad_norm,
         "value_loss_coef": value_loss_coef,
         "entropy_coef": entropy_coef,
+        "target_kl": target_kl,
         "policy_class_name": policy_class_name,
     },
     dir=log_dir,
@@ -629,7 +634,10 @@ for iteration in range(max_iterations):
     mean_value_loss = 0.0
     mean_surrogate_loss = 0.0
     mean_entropy = 0.0
+    mean_approx_kl = 0.0
     dropped_minibatch_samples = 0
+    num_updates_done = 0
+    kl_early_stopped = False
 
     generator = storage.mini_batch_generator(num_mini_batches, num_learning_epochs)
 
@@ -683,17 +691,34 @@ for iteration in range(max_iterations):
 
         # --- SPO policy loss ---
         log_ratio = actions_log_prob_batch - old_actions_log_prob_batch.squeeze(-1)
-        log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+        log_ratio = torch.clamp(log_ratio, -2.0, 2.0) # ratio in [0.13, 7.4]
         ratio = torch.exp(log_ratio)
+
+        # KL early stopping: break if policy has drifted too far
+        with torch.no_grad():
+            approx_kl = ((ratio - 1) - log_ratio).mean().item()
+            mean_approx_kl += approx_kl
+        if target_kl is not None and approx_kl > 1.5 * target_kl:
+            kl_early_stopped = True
+            break
         advantages = advantages_batch.squeeze(-1)
 
         # Per-mini-batch advantage normalization
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = advantages.clamp(-4.0, 4.0)
 
+        # Official SPO loss with quadratic penalty:
+        # surrogate_loss = -(
+        #     ratio * advantages
+        #     - advantages.abs() / (2.0 * epsilon) * (ratio - 1.0).pow(2)
+        # ).mean()
+        # log_ratio panelty:
         surrogate_loss = -(
             ratio * advantages
-            - advantages.abs() / (2.0 * epsilon) * (ratio - 1.0).pow(2)
+            - advantages.abs() / (2.0 * epsilon) * log_ratio.pow(2)
         ).mean()
+        # control test: ablation quadratic penalty
+        # surrogate_loss = -(ratio * advantages).mean()  # Ablation: no quadratic penalty
 
         # --- Value loss (clipped) ---
         if use_clipped_value_loss:
@@ -728,11 +753,13 @@ for iteration in range(max_iterations):
         mean_value_loss += value_loss.item()
         mean_surrogate_loss += surrogate_loss.item()
         mean_entropy += entropy_batch.mean().item()
+        num_updates_done += 1
 
-    num_updates = num_learning_epochs * num_mini_batches
-    mean_value_loss /= num_updates
-    mean_surrogate_loss /= num_updates
-    mean_entropy /= num_updates
+    num_updates_done = max(num_updates_done, 1)
+    mean_value_loss /= num_updates_done
+    mean_surrogate_loss /= num_updates_done
+    mean_entropy /= num_updates_done
+    mean_approx_kl /= num_updates_done
 
     # --- LR schedule: linear decay initial_lr → final_lr, then hold ---
     if iteration < lr_decay_iters:
@@ -767,6 +794,7 @@ for iteration in range(max_iterations):
         f"NoiseStd: {noise_std:.3f} | "
         f"LR: {lr_now:.1e} | "
         f"FPS: {fps:,.0f} | "
+        f"KL: {mean_approx_kl:.4f}{' (early stop)' if kl_early_stopped else ''} | "
         f"ForcedDone: {forced_done_count} | "
         f"Dropped: {dropped_minibatch_samples}"
     )
@@ -783,6 +811,9 @@ for iteration in range(max_iterations):
         "perf/collection_time": collection_time,
         "perf/learn_time": learn_time,
         "perf/iter_time": iter_time,
+        "policy/approx_kl": mean_approx_kl,
+        "policy/kl_early_stopped": int(kl_early_stopped),
+        "policy/num_updates_done": num_updates_done,
         "debug/forced_done_count": forced_done_count,
         "debug/dropped_minibatch_samples": dropped_minibatch_samples,
         "train/total_steps": total_steps,
