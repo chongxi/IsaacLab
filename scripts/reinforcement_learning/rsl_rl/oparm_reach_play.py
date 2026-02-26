@@ -36,7 +36,7 @@ from isaaclab_tasks.manager_based.manipulation.reach.config.openarm.bimanual.age
 # ==============================================================================
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_15-53-50/model_550.pt"
 # CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_17-19-37/model_200.pt"
-CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_18-05-06/model_1500.pt"
+CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_19-27-23/model_1250.pt"
 
 # ==============================================================================
 # Configuration of the environment and agent
