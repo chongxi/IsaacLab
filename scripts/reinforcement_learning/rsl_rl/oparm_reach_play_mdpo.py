@@ -1,11 +1,16 @@
 """
-Play a trained SPO checkpoint for Isaac-Reach-OpenArm-Bi-v0.
+Play a trained MDPO checkpoint for Isaac-Reach-OpenArm-Bi-v0.
 
-This script loads checkpoints saved by oparm_reach_train_spo.py, which uses a
-custom ActorCritic (with log_std) that is incompatible with RSL-RL's OnPolicyRunner.
+MDPO trains TWO policies simultaneously (mutual distillation). The checkpoint
+contains both:
+    - "model_1_state_dict": policy 1 (trained on odd-indexed envs)
+    - "model_2_state_dict": policy 2 (trained on even-indexed envs)
+
+By default this script loads policy 1. Set POLICY_INDEX = 2 to play policy 2.
+Both policies should behave similarly due to mutual distillation.
 
 Usage:
-    ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/oparm_reach_play_spo.py
+    ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/oparm_reach_play_mdpo.py
 """
 
 # ==============================================================================
@@ -62,7 +67,6 @@ class ActorCritic_MLP(nn.Module):
         }
         act_fn = activations[activation]
 
-        # Actor
         actor_layers = []
         in_dim = num_obs
         for h_dim in actor_hidden_dims:
@@ -73,7 +77,6 @@ class ActorCritic_MLP(nn.Module):
         actor_layers.append(nn.Tanh())
         self.actor = nn.Sequential(*actor_layers)
 
-        # Critic
         critic_layers = []
         in_dim = num_obs
         for h_dim in critic_hidden_dims:
@@ -83,7 +86,6 @@ class ActorCritic_MLP(nn.Module):
         critic_layers.append(layer_init(nn.Linear(in_dim, 1), std=1.0))
         self.critic = nn.Sequential(*critic_layers)
 
-        # log_std (matches training script)
         self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(1, num_actions)))
         self._distribution: Normal | None = None
         Normal.set_default_validate_args(False)
@@ -133,7 +135,7 @@ class NeuralJacobianPolicy(nn.Module):
         arm_key_input_dim = 4 * self.dof_per_arm
         self.arm_key = nn.Sequential(
             layer_init(nn.Linear(arm_key_input_dim, attn_dim)),
-            # act_fn(),
+            act_fn(),
             layer_init(nn.Linear(attn_dim, self.err_dim_per_arm * attn_dim), std=0.01),
         )
         self.joint_id_embed = nn.Parameter(torch.zeros(self.dof_per_arm, attn_dim))
@@ -320,15 +322,10 @@ def _flatten_obs(obs: TensorDict) -> torch.Tensor:
 # ==============================================================================
 # Checkpoint — update this path to the checkpoint you want to play
 # ==============================================================================
-# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_19-27-23/model_1250.pt"
-# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_21-40-37/model_1500.pt"
-# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-09-04/model_1500.pt"
-# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_22-26-40/model_1500.pt"
-# CHECKPOINT_PATH = "./logs/rsl_rl/openarm_bi_reach/2026-02-25_23-14-01/model_1500.pt"
-# CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-26_09-35-12/model_1500.pt"
-# CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-26_12-27-19/model_1500.pt"
-# CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-26_14-09-34/model_1500.pt"
-CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-28_21-14-52/model_1500.pt"
+CHECKPOINT_PATH = "logs/rsl_rl/openarm_bi_reach/2026-02-28_23-44-02/model_1500.pt"
+
+# Which of the two MDPO policies to play (1 or 2)
+POLICY_INDEX = 1
 
 # ==============================================================================
 # Network config — must match the training run that produced the checkpoint
@@ -349,20 +346,19 @@ env_cfg.scene.num_envs = 8
 env_cfg.seed = 42
 env_cfg.sim.device = "cuda:0"
 
-# Match training-time action interface (relative joint position / delta action).
 env_cfg.actions.left_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
     asset_name="robot",
     joint_names=["openarm_left_joint.*"],
-    scale=0.3,
+    scale=0.5,
     use_zero_offset=True,
-    alpha=0.3,
+    alpha=0.7,
 )
 env_cfg.actions.right_arm_action = reach_mdp.EMARelativeJointPositionActionCfg(
     asset_name="robot",
     joint_names=["openarm_right_joint.*"],
-    scale=0.3,
+    scale=0.5,
     use_zero_offset=True,
-    alpha=0.3,
+    alpha=0.7,
 )
 
 env = gym.make("Isaac-Reach-OpenArm-Bi-v0", cfg=env_cfg)
@@ -398,17 +394,19 @@ if POLICY_CLASS_NAME.lower() == "njp":
 policy = policy_cls(**policy_kwargs).to(device)
 
 checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=True)
-policy.load_state_dict(checkpoint["model_state_dict"])
+state_dict_key = f"model_{POLICY_INDEX}_state_dict"
+policy.load_state_dict(checkpoint[state_dict_key])
 policy.eval()
 
-print(f"Loaded checkpoint: {CHECKPOINT_PATH}")
+print(f"Loaded MDPO checkpoint: {CHECKPOINT_PATH}")
+print(f"  Policy index: {POLICY_INDEX} of 2")
 print(f"  Iteration: {checkpoint.get('iter', '?')}")
 print(f"  Policy class: {policy.__class__.__name__}")
 print(f"  Network: actor={ACTOR_HIDDEN_DIMS}, critic={CRITIC_HIDDEN_DIMS}, act={ACTIVATION}")
 print(f"  Obs dim: {num_obs}, Action dim: {num_actions}")
 
 # ==============================================================================
-# Play loop (obs already populated from env.reset() above)
+# Play loop
 # ==============================================================================
 while simulation_app.is_running():
     with torch.inference_mode():

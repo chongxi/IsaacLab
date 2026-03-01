@@ -167,7 +167,7 @@ class ActorCritic_MLP(nn.Module):
         return self._distribution.log_prob(actions).sum(dim=-1)
 
 
-class ActorCritic_NEW(nn.Module):
+class NeuralJacobianPolicy(nn.Module):
     """Structured actor-critic: context -> matrix, then matrix @ error -> action mean."""
 
     is_recurrent = False
@@ -180,6 +180,7 @@ class ActorCritic_NEW(nn.Module):
         critic_hidden_dims: list[int] = [64, 64],
         activation: str = "tanh",
         init_noise_std: float = 1.0,
+        gate: bool = False,
     ):
         super().__init__()
 
@@ -191,7 +192,7 @@ class ActorCritic_NEW(nn.Module):
         self.expected_obs_dim = 6 * self.dof_per_arm + 2 * self.err_dim_per_arm
         if num_obs != self.expected_obs_dim:
             raise ValueError(
-                "ActorCritic_NEW expects explicit error observation layout "
+                "NeuralJacobianPolicy expects explicit error observation layout "
                 "[l_q, r_q, l_dq, r_dq, l_err6, r_err6, l_prev_a, r_prev_a]. "
                 f"Got num_obs={num_obs}, expected={self.expected_obs_dim}."
             )
@@ -206,15 +207,25 @@ class ActorCritic_NEW(nn.Module):
         }
         act_fn = activations[activation]
 
-        # Transformer-style dynamic pseudo-Jacobian from (q, dq) only:
-        # A = a_scale * (Q(q,dq) @ K(q,dq)^T / sqrt(d)),  u = A @ e
         attn_dim = actor_hidden_dims[0] if len(actor_hidden_dims) > 0 else 64
-        self.joint_query = layer_init(nn.Linear(2, attn_dim), std=0.01)
-        self.arm_key = layer_init(nn.Linear(2 * self.dof_per_arm, self.err_dim_per_arm * attn_dim), std=0.01)
+        # Query input: (sin(q_i), cos(q_i), sin(dq_i), cos(dq_i)) — 4 values per joint
+        self.joint_query = layer_init(nn.Linear(4, attn_dim), std=0.01)
+        # Key input: (sin(q), cos(q), sin(dq), cos(dq)) — 4 * dof_per_arm values
+        arm_key_input_dim = 4 * self.dof_per_arm
+        self.arm_key = nn.Sequential(
+            layer_init(nn.Linear(arm_key_input_dim, attn_dim)),
+            # act_fn(),
+            layer_init(nn.Linear(attn_dim, self.err_dim_per_arm * attn_dim), std=0.01),
+        )
         self.joint_id_embed = nn.Parameter(torch.zeros(self.dof_per_arm, attn_dim))
         nn.init.normal_(self.joint_id_embed, mean=0.0, std=0.02)
         self.attn_scale = float(attn_dim) ** -0.5
         self.a_scale = nn.Parameter(torch.ones(self.dof_per_arm, self.err_dim_per_arm))
+
+        # Error-magnitude gating: sigmoid(linear(||error||)) per arm
+        self.use_gate = gate
+        if gate:
+            self.error_gate = layer_init(nn.Linear(1, 1), std=0.01)
 
         # Critic remains standard MLP on full observation
         critic_layers = []
@@ -256,18 +267,18 @@ class ActorCritic_NEW(nn.Module):
     def _actor_mean(self, obs: torch.Tensor) -> torch.Tensor:
         left_q, right_q, left_dq, right_dq, left_err, right_err = self._split_obs(obs)
 
-        # per-joint tokens: [q_i, dq_i] -> query_i
-        left_joint_tokens = torch.stack([left_q, left_dq], dim=-1)   # [B, n, 2]
-        right_joint_tokens = torch.stack([right_q, right_dq], dim=-1)  # [B, n, 2]
-        left_query = self.joint_query(left_joint_tokens)   # [B, n, d]
-        right_query = self.joint_query(right_joint_tokens)  # [B, n, d]
-        joint_bias = self.joint_id_embed.unsqueeze(0)  # [1, n, d]
+        # Query: per-joint trig features (sin(q_i), cos(q_i), sin(dq_i), cos(dq_i))
+        left_joint_tokens = torch.stack([torch.sin(left_q), torch.cos(left_q), torch.sin(left_dq), torch.cos(left_dq)], dim=-1)
+        right_joint_tokens = torch.stack([torch.sin(right_q), torch.cos(right_q), torch.sin(right_dq), torch.cos(right_dq)], dim=-1)
+        left_query = self.joint_query(left_joint_tokens)
+        right_query = self.joint_query(right_joint_tokens)
+        joint_bias = self.joint_id_embed.unsqueeze(0)
         left_query = left_query + joint_bias
         right_query = right_query + joint_bias
 
-        # state-dependent keys K(q,dq) per arm: [B, 6, d]
-        left_state = torch.cat([left_q, left_dq], dim=-1)
-        right_state = torch.cat([right_q, right_dq], dim=-1)
+        # Key: global trig features (sin(q_all), cos(q_all), sin(dq_all), cos(dq_all))
+        left_state = torch.cat([torch.sin(left_q), torch.cos(left_q), torch.sin(left_dq), torch.cos(left_dq)], dim=-1)
+        right_state = torch.cat([torch.sin(right_q), torch.cos(right_q), torch.sin(right_dq), torch.cos(right_dq)], dim=-1)
         left_key = self.arm_key(left_state).view(-1, self.err_dim_per_arm, left_query.shape[-1])
         right_key = self.arm_key(right_state).view(-1, self.err_dim_per_arm, right_query.shape[-1])
 
@@ -283,9 +294,155 @@ class ActorCritic_NEW(nn.Module):
 
         left_u = torch.bmm(left_A, left_err.unsqueeze(-1)).squeeze(-1)
         right_u = torch.bmm(right_A, right_err.unsqueeze(-1)).squeeze(-1)
+
+        if self.use_gate:
+            left_gate = torch.sigmoid(self.error_gate(left_err.norm(dim=-1, keepdim=True)))
+            right_gate = torch.sigmoid(self.error_gate(right_err.norm(dim=-1, keepdim=True)))
+            left_u = left_gate * left_u
+            right_u = right_gate * right_u
+
         u = torch.cat([left_u, right_u], dim=-1)
-        # u = torch.tanh(u)  # Ensure mean actions are in [-1, 1]; remove if not needed
         return u
+
+    def forward_actor(self, obs: torch.Tensor) -> Normal:
+        mean = self._actor_mean(obs)
+        log_std = self.log_std.clamp(-20.0, 2.0)
+        std = log_std.exp().expand_as(mean)
+        self._distribution = Normal(mean, std)
+        return self._distribution
+
+    def forward_critic(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(obs)
+
+    def act(self, obs: torch.Tensor) -> torch.Tensor:
+        dist = self.forward_actor(obs)
+        return dist.sample()
+
+    def act_inference(self, obs: torch.Tensor) -> torch.Tensor:
+        return self._actor_mean(obs)
+
+    def evaluate(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.forward_critic(obs)
+
+    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._distribution.log_prob(actions).sum(dim=-1)
+
+
+class NeuralJacobianLocalPolicy(nn.Module):
+    """Local-attention Jacobian actor: both query and key are per-token local.
+
+    Unlike NeuralJacobianPolicy where keys come from the global arm state,
+    here each error dimension is its own token with a local projection.
+    Query: per-joint (q_i, dq_i) + joint_id_embed  →  local
+    Key:   per-error-dim (err_e) + error_id_embed   →  local
+    A = Q @ K^T  →  (joints × error_dims) pseudo-Jacobian
+    action = A @ error
+    """
+
+    is_recurrent = False
+
+    def __init__(
+        self,
+        num_obs: int,
+        num_actions: int,
+        actor_hidden_dims: list[int] = [64, 64],
+        critic_hidden_dims: list[int] = [64, 64],
+        activation: str = "tanh",
+        init_noise_std: float = 1.0,
+    ):
+        super().__init__()
+
+        if num_actions % 2 != 0:
+            raise ValueError(f"Expected even number of actions (bimanual), got {num_actions}.")
+
+        self.dof_per_arm = num_actions // 2
+        self.err_dim_per_arm = 6
+        self.expected_obs_dim = 6 * self.dof_per_arm + 2 * self.err_dim_per_arm
+        if num_obs != self.expected_obs_dim:
+            raise ValueError(
+                "NeuralJacobianLocalPolicy expects explicit error observation layout "
+                "[l_q, r_q, l_dq, r_dq, l_err6, r_err6, l_prev_a, r_prev_a]. "
+                f"Got num_obs={num_obs}, expected={self.expected_obs_dim}."
+            )
+
+        activations = {
+            "elu": nn.ELU, "relu": nn.ReLU, "tanh": nn.Tanh,
+            "leaky_relu": nn.LeakyReLU, "selu": nn.SELU, "gelu": nn.GELU,
+        }
+        act_fn = activations[activation]
+
+        attn_dim = actor_hidden_dims[0] if len(actor_hidden_dims) > 0 else 64
+        # Query: per-joint local projection
+        self.joint_query = layer_init(nn.Linear(2, attn_dim), std=0.01)
+        self.joint_id_embed = nn.Parameter(torch.zeros(self.dof_per_arm, attn_dim))
+        nn.init.normal_(self.joint_id_embed, mean=0.0, std=0.02)
+        # Key: per-error-dim local projection
+        self.error_key = layer_init(nn.Linear(1, attn_dim), std=0.01)
+        self.error_id_embed = nn.Parameter(torch.zeros(self.err_dim_per_arm, attn_dim))
+        nn.init.normal_(self.error_id_embed, mean=0.0, std=0.02)
+
+        self.attn_scale = float(attn_dim) ** -0.5
+
+        # Critic remains standard MLP on full observation
+        critic_layers = []
+        in_dim = num_obs
+        for h_dim in critic_hidden_dims:
+            critic_layers.append(layer_init(nn.Linear(in_dim, h_dim)))
+            critic_layers.append(act_fn())
+            in_dim = h_dim
+        critic_layers.append(layer_init(nn.Linear(in_dim, 1), std=1.0))
+        self.critic = nn.Sequential(*critic_layers)
+
+        self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(1, num_actions)))
+        self._distribution: Normal | None = None
+        Normal.set_default_validate_args(False)
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        return self.log_std.exp()
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        return self._distribution.mean
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        return self._distribution.entropy().sum(dim=-1)
+
+    def _split_obs(self, obs: torch.Tensor):
+        n = self.dof_per_arm
+        left_q = obs[:, 0:n]
+        right_q = obs[:, n:2 * n]
+        left_dq = obs[:, 2 * n:3 * n]
+        right_dq = obs[:, 3 * n:4 * n]
+        left_err = obs[:, 4 * n:4 * n + self.err_dim_per_arm]
+        right_err = obs[:, 4 * n + self.err_dim_per_arm:4 * n + 2 * self.err_dim_per_arm]
+        return left_q, right_q, left_dq, right_dq, left_err, right_err
+
+    def _actor_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        left_q, right_q, left_dq, right_dq, left_err, right_err = self._split_obs(obs)
+
+        # Query: per-joint local tokens [q_i, dq_i] → (B, n_joints, d)
+        left_joint_tokens = torch.stack([left_q, left_dq], dim=-1)
+        right_joint_tokens = torch.stack([right_q, right_dq], dim=-1)
+        left_query = self.joint_query(left_joint_tokens) + self.joint_id_embed.unsqueeze(0)
+        right_query = self.joint_query(right_joint_tokens) + self.joint_id_embed.unsqueeze(0)
+
+        # Key: per-error-dim local tokens [err_e] → (B, 6, d)
+        left_err_tokens = left_err.unsqueeze(-1)    # [B, 6, 1]
+        right_err_tokens = right_err.unsqueeze(-1)   # [B, 6, 1]
+        left_key = self.error_key(left_err_tokens) + self.error_id_embed.unsqueeze(0)
+        right_key = self.error_key(right_err_tokens) + self.error_id_embed.unsqueeze(0)
+
+        # Pseudo-Jacobian: A = Q @ K^T → (B, n_joints, 6)
+        left_A = torch.einsum("bnd,bmd->bnm", left_query, left_key) * self.attn_scale
+        right_A = torch.einsum("bnd,bmd->bnm", right_query, right_key) * self.attn_scale
+
+        # Action: A @ error → (B, n_joints)
+        left_u = torch.bmm(left_A, left_err.unsqueeze(-1)).squeeze(-1)
+        right_u = torch.bmm(right_A, right_err.unsqueeze(-1)).squeeze(-1)
+
+        return torch.cat([left_u, right_u], dim=-1)
 
     def forward_actor(self, obs: torch.Tensor) -> Normal:
         mean = self._actor_mean(obs)
@@ -433,7 +590,8 @@ actor_hidden_dims = [64, 64]
 critic_hidden_dims = [64, 64]
 activation = "elu"       # official SPO repo uses Tanh
 init_noise_std = 1.0
-policy_class_name = "new"  # "mlp" or "new"
+policy_class_name = "njp"  # "mlp", "njp", or "njp_local"
+use_error_gate = False  # error-magnitude gating (NJP only)
 
 # ==============================================================================
 # Step 1: Create environment
@@ -458,18 +616,23 @@ print(f"Observation dim: {num_obs}, Action dim: {num_actions}")
 # Create our custom network
 policy_class_map = {
     "mlp": ActorCritic_MLP,
-    "new": ActorCritic_NEW,
+    "njp": NeuralJacobianPolicy,
+    "njp_local": NeuralJacobianLocalPolicy,
 }
 policy_cls = policy_class_map[policy_class_name.lower()]
 
-policy = policy_cls(
+policy_kwargs = dict(
     num_obs=num_obs,
     num_actions=num_actions,
     actor_hidden_dims=actor_hidden_dims,
     critic_hidden_dims=critic_hidden_dims,
     activation=activation,
     init_noise_std=init_noise_std,
-).to(device)
+)
+if policy_cls is NeuralJacobianPolicy:
+    policy_kwargs["gate"] = use_error_gate
+
+policy = policy_cls(**policy_kwargs).to(device)
 
 if hasattr(policy, "actor"):
     print(f"Actor:  {policy.actor}")
@@ -483,10 +646,10 @@ optimizer = torch.optim.AdamW(policy.parameters(), lr=initial_lr)
 
 # Rollout storage (reuse RSL-RL's GAE computation)
 storage = RolloutStorage(
-    training_type="rl",
     num_envs=env.num_envs,
     num_transitions_per_env=num_steps_per_env,
-    obs=obs_td,
+    obs_shape=(num_obs,),
+    privileged_obs_shape=(None,),
     actions_shape=(num_actions,),
     device=device,
 )
@@ -570,7 +733,7 @@ for iteration in range(max_iterations):
             invalid_now = invalid_obs_before | invalid_actions
 
             # Store transition (RolloutStorage interface)
-            transition.observations = obs_td
+            transition.observations = obs_flat
             transition.actions = actions.detach()
             transition.values = values.detach()
             transition.actions_log_prob = log_probs.detach()
@@ -619,7 +782,7 @@ for iteration in range(max_iterations):
         # Compute returns (GAE) — normalize per mini-batch, not globally
         obs_flat = _flatten_obs(obs_td)
         last_values = policy.evaluate(obs_flat).detach()
-        storage.compute_returns(last_values, gamma, lam, normalize_advantage=False)
+        storage.compute_returns(last_values, gamma, lam)
 
     # ==================================================================
     # Phase 2: SPO update
@@ -642,7 +805,8 @@ for iteration in range(max_iterations):
     generator = storage.mini_batch_generator(num_mini_batches, num_learning_epochs)
 
     for (
-        obs_batch,           # TensorDict
+        obs_batch,
+        _critic_obs_batch,
         actions_batch,
         target_values_batch,
         advantages_batch,
@@ -652,8 +816,10 @@ for iteration in range(max_iterations):
         old_sigma_batch,
         hidden_states_batch,
         masks_batch,
+        _dropout_masks_a,
+        _dropout_masks_c,
     ) in generator:
-        obs_flat_batch = _flatten_obs(obs_batch)
+        obs_flat_batch = obs_batch
 
         valid_rows = (
             _row_is_finite(obs_flat_batch)
