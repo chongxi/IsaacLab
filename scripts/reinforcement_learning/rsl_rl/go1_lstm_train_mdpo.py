@@ -88,8 +88,8 @@ env_cfg.actions.joint_pos.scale = 0.5
 device = "cuda:0"
 
 # --- Reward overrides (SAME as CPG experiment) ---
-env_cfg.rewards.action_rate_l2 = None
-env_cfg.rewards.flat_orientation_l2.weight = -0.5
+# env_cfg.rewards.action_rate_l2 = None
+env_cfg.rewards.flat_orientation_l2.weight = -5.0
 env_cfg.rewards.lin_vel_z_l2.weight = -0.5
 env_cfg.rewards.track_lin_vel_xy_exp.weight = 6.0 # 3.0
 env_cfg.rewards.track_ang_vel_z_exp.weight = 5.0 # 2.0
@@ -275,6 +275,9 @@ for iteration in range(max_iterations):
     mean_reward = np.mean(rewbuffer) if rewbuffer else 0.0
     mean_ep_len = np.mean(lenbuffer) if lenbuffer else 0.0
 
+    # Extract per-term reward info from extras (populated on env resets)
+    log_extras = extras.get("log", {}) if isinstance(extras, dict) else {}
+
     log_dict = {
         "Loss/value": mean_value_loss,
         "Loss/surrogate": mean_surrogate_loss,
@@ -288,12 +291,28 @@ for iteration in range(max_iterations):
         "Train/mean_displacement": mean_displacement,
     }
 
+    # Log all individual reward terms from the environment
+    for key, value in log_extras.items():
+        if key.startswith("Episode_Reward/"):
+            log_dict[key] = value.item() if isinstance(value, torch.Tensor) else value
+
     if iteration % 10 == 0:
         log_dict["LSTM/action_std_mean"] = actor_critic_1.action_std.mean().item()
 
     wandb.log(log_dict, step=iteration)
 
     if iteration % 10 == 0:
+        # Extract specific reward terms for printing
+        r_base_height = log_extras.get("Episode_Reward/base_height", 0.0)
+        r_foot_clear = log_extras.get("Episode_Reward/foot_clearance", 0.0)
+        r_flat_orient = log_extras.get("Episode_Reward/flat_orientation_l2", 0.0)
+        if isinstance(r_base_height, torch.Tensor):
+            r_base_height = r_base_height.item()
+        if isinstance(r_foot_clear, torch.Tensor):
+            r_foot_clear = r_foot_clear.item()
+        if isinstance(r_flat_orient, torch.Tensor):
+            r_flat_orient = r_flat_orient.item()
+
         print(
             f"[{iteration:4d}/{max_iterations}]  "
             f"reward={mean_reward:7.2f}  "
@@ -307,7 +326,9 @@ for iteration in range(max_iterations):
             f"collect={collection_time:.2f}s  learn={learn_time:.2f}s"
         )
         print(
-            f"  [LSTM] std_mean={actor_critic_1.action_std.mean().item():.4f}"
+            f"  [LSTM] std_mean={actor_critic_1.action_std.mean().item():.4f}  "
+            f"base_height={r_base_height:.4f}  foot_clearance={r_foot_clear:.4f}  "
+            f"flat_orient={r_flat_orient:.4f}"
         )
 
     # ==================================================================

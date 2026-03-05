@@ -209,7 +209,8 @@ class CPG_Reflex_ActorCritic(nn.Module):
 # ==============================================================================
 # Checkpoint — update this path
 # ==============================================================================
-CHECKPOINT_PATH = "logs/rsl_rl/go1_cpg_mdpo/2026-03-03_18-02-49/model_1500.pt"
+# CHECKPOINT_PATH = "logs/rsl_rl/go1_cpg_mdpo/2026-03-03_18-02-49/model_1500.pt"
+CHECKPOINT_PATH = "logs/rsl_rl/go1_cpg_mdpo/2026-03-03_20-47-22/model_1500.pt"
 
 # Which MDPO policy to play (1 or 2)
 POLICY_INDEX = 1

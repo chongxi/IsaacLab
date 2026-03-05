@@ -85,6 +85,34 @@ def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = Scen
     return reward
 
 
+def min_foot_lift(
+    env,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    min_height: float = 0.04,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Penalize swing feet that fail to reach a minimum height off the ground.
+
+    Only active during swing phase (not in contact) and when velocity command is non-zero.
+    Returns the sum of height deficits across all feet.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset = env.scene[asset_cfg.name]
+    # feet in swing phase: not in contact
+    contacts = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
+    in_swing = ~contacts  # (B, num_feet)
+    # foot heights
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]  # (B, num_feet)
+    # height deficit: how much below min_height
+    deficit = torch.clamp(min_height - foot_z, min=0.0)  # (B, num_feet)
+    # only penalize during swing and when commanded to move
+    cmd = torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1)
+    reward = torch.sum(deficit * in_swing, dim=1)  # (B,)
+    reward *= (cmd > 0.1).float()
+    return reward
+
+
 def track_lin_vel_xy_yaw_frame_exp(
     env, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:

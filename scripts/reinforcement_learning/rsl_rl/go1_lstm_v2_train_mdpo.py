@@ -373,11 +373,11 @@ device = "cuda:0"
 
 # --- Reward overrides (SAME as CPG experiment) ---
 # env_cfg.rewards.action_rate_l2 = None
-# env_cfg.rewards.flat_orientation_l2.weight = -0.5
-# env_cfg.rewards.lin_vel_z_l2.weight = -0.5
-# env_cfg.rewards.track_lin_vel_xy_exp.weight = 3.0
-# env_cfg.rewards.track_ang_vel_z_exp.weight = 2.0
-# env_cfg.rewards.feet_air_time.weight = 0.5
+env_cfg.rewards.flat_orientation_l2.weight = -5.0
+env_cfg.rewards.lin_vel_z_l2.weight = -0.5
+env_cfg.rewards.track_lin_vel_xy_exp.weight = 6.0 # 3.0
+env_cfg.rewards.track_ang_vel_z_exp.weight = 5.0 # 2.0
+env_cfg.rewards.feet_air_time.weight = 0.5
 
 max_iterations = 1500
 num_steps_per_env = 24

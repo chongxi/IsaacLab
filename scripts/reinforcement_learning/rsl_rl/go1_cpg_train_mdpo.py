@@ -535,19 +535,20 @@ env_cfg.actions.joint_pos.scale = 0.5  # standard Go1 setting; unbounded network
 device = "cuda:0"
 
 # --- Reward overrides (SAME as CPG experiment) ---
-env_cfg.rewards.action_rate_l2 = None
-env_cfg.rewards.flat_orientation_l2.weight = -0.5
+# env_cfg.rewards.action_rate_l2 = None
+env_cfg.rewards.flat_orientation_l2.weight = -5.0
 env_cfg.rewards.lin_vel_z_l2.weight = -0.5
 env_cfg.rewards.track_lin_vel_xy_exp.weight = 6.0 # 3.0
+env_cfg.rewards.track_lin_vel_xy_exp.params["std"] = math.sqrt(1.0)
 env_cfg.rewards.track_ang_vel_z_exp.weight = 5.0 # 2.0
-env_cfg.rewards.feet_air_time.weight = 1.5
+env_cfg.rewards.feet_air_time.weight = 0.5
 
 max_iterations = 1500
 num_steps_per_env = 24
 save_interval = 50
 
 # CPG (frozen clock — no gradients flow through CPG)
-cpg_dt = 0.1
+cpg_dt = 0.3
 cpg_substeps = 1
 bptt_length = 0
 
@@ -754,11 +755,25 @@ for iteration in range(max_iterations):
     total_time = time.time() - iter_start
 
     # ==================================================================
+    # Gait weight curriculum: multiply by 2 every 200 iterations, cap at 20
+    # ==================================================================
+    if iteration > 0 and iteration % 200 == 0:
+        gait_cfg = env.unwrapped.reward_manager.get_term_cfg("gait")
+        new_weight = min(gait_cfg.weight * 2, 20.0)
+        if gait_cfg.weight < 20.0:
+            gait_cfg.weight = new_weight
+            env.unwrapped.reward_manager.set_term_cfg("gait", gait_cfg)
+            print(f"  [Curriculum] Gait weight updated: {new_weight:.1f}")
+
+    # ==================================================================
     # Logging
     # ==================================================================
     fps = int(env.num_envs * num_steps_per_env / total_time)
     mean_reward = np.mean(rewbuffer) if rewbuffer else 0.0
     mean_ep_len = np.mean(lenbuffer) if lenbuffer else 0.0
+
+    # Extract per-term reward info from extras (populated on env resets)
+    log_extras = extras.get("log", {}) if isinstance(extras, dict) else {}
 
     log_dict = {
         "Loss/value": mean_value_loss,
@@ -773,6 +788,15 @@ for iteration in range(max_iterations):
         "Train/mean_displacement": mean_displacement,
     }
 
+    # Log all individual reward terms from the environment
+    for key, value in log_extras.items():
+        if key.startswith("Episode_Reward/"):
+            log_dict[key] = value.item() if isinstance(value, torch.Tensor) else value
+
+    # Log gait weight curriculum
+    gait_weight = env.unwrapped.reward_manager.get_term_cfg("gait").weight
+    log_dict["Curriculum/gait_weight"] = gait_weight
+
     # Log architecture-specific diagnostics
     if iteration % 10 == 0:
         log_dict["action_std_mean"] = actor_critic_1.log_std.clamp(-5.0, 0.5).exp().mean().item()
@@ -782,6 +806,19 @@ for iteration in range(max_iterations):
     wandb.log(log_dict, step=iteration)
 
     if iteration % 10 == 0:
+        def _to_float(v):
+            return v.item() if isinstance(v, torch.Tensor) else float(v)
+
+        r_base_height = _to_float(log_extras.get("Episode_Reward/base_height", 0.0))
+        r_foot_clear = _to_float(log_extras.get("Episode_Reward/foot_clearance", 0.0))
+        r_flat_orient = _to_float(log_extras.get("Episode_Reward/flat_orientation_l2", 0.0))
+        r_track_lin = _to_float(log_extras.get("Episode_Reward/track_lin_vel_xy_exp", 0.0))
+        r_track_ang = _to_float(log_extras.get("Episode_Reward/track_ang_vel_z_exp", 0.0))
+        r_feet_air = _to_float(log_extras.get("Episode_Reward/feet_air_time", 0.0))
+        r_gait = _to_float(log_extras.get("Episode_Reward/gait", 0.0))
+        r_feet_slide = _to_float(log_extras.get("Episode_Reward/feet_slide", 0.0))
+        r_min_lift = _to_float(log_extras.get("Episode_Reward/min_foot_lift", 0.0))
+
         print(
             f"[{iteration:4d}/{max_iterations}]  "
             f"reward={mean_reward:7.2f}  "
@@ -795,7 +832,12 @@ for iteration in range(max_iterations):
             f"collect={collection_time:.2f}s  learn={learn_time:.2f}s"
         )
         print(
-            f"  std={actor_critic_1.log_std.clamp(-5.0, 0.5).exp().mean().item():.4f}"
+            f"  std={actor_critic_1.log_std.clamp(-5.0, 0.5).exp().mean().item():.4f}  "
+            f"base_height={r_base_height:.4f}  foot_clear={r_foot_clear:.4f}  "
+            f"flat_orient={r_flat_orient:.4f}  "
+            f"track_lin={r_track_lin:.4f}  track_ang={r_track_ang:.4f}  "
+            f"feet_air={r_feet_air:.4f}  gait={r_gait:.4f}  "
+            f"slide={r_feet_slide:.4f}  lift={r_min_lift:.4f}"
         )
 
     # ==================================================================
