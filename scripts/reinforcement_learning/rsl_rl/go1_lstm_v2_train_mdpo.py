@@ -559,6 +559,9 @@ for iteration in range(max_iterations):
     mean_reward = np.mean(rewbuffer) if rewbuffer else 0.0
     mean_ep_len = np.mean(lenbuffer) if lenbuffer else 0.0
 
+    # Extract per-term reward info from extras (populated on env resets)
+    log_extras = extras.get("log", {}) if isinstance(extras, dict) else {}
+
     log_dict = {
         "Loss/value": mean_value_loss,
         "Loss/surrogate": mean_surrogate_loss,
@@ -572,12 +575,27 @@ for iteration in range(max_iterations):
         "Train/mean_displacement": mean_displacement,
     }
 
+    # Log all individual reward terms from the environment
+    for key, value in log_extras.items():
+        if key.startswith("Episode_Reward/"):
+            log_dict[key] = value.item() if isinstance(value, torch.Tensor) else value
+
     if iteration % 10 == 0:
         log_dict["LSTM/action_std_mean"] = actor_critic_1.action_std.mean().item()
 
     wandb.log(log_dict, step=iteration)
 
     if iteration % 10 == 0:
+        def _to_float(v):
+            return v.item() if isinstance(v, torch.Tensor) else float(v)
+
+        r_flat_orient = _to_float(log_extras.get("Episode_Reward/flat_orientation_l2", 0.0))
+        r_track_lin = _to_float(log_extras.get("Episode_Reward/track_lin_vel_xy_exp", 0.0))
+        r_track_ang = _to_float(log_extras.get("Episode_Reward/track_ang_vel_z_exp", 0.0))
+        r_feet_air = _to_float(log_extras.get("Episode_Reward/feet_air_time", 0.0))
+        r_lin_vel_z = _to_float(log_extras.get("Episode_Reward/lin_vel_z_l2", 0.0))
+        r_action_rate = _to_float(log_extras.get("Episode_Reward/action_rate_l2", 0.0))
+
         print(
             f"[{iteration:4d}/{max_iterations}]  "
             f"reward={mean_reward:7.2f}  "
@@ -591,7 +609,11 @@ for iteration in range(max_iterations):
             f"collect={collection_time:.2f}s  learn={learn_time:.2f}s"
         )
         print(
-            f"  [LSTM] std_mean={actor_critic_1.action_std.mean().item():.4f}"
+            f"  std={actor_critic_1.action_std.mean().item():.4f}  "
+            f"flat_orient={r_flat_orient:.4f}  "
+            f"track_lin={r_track_lin:.4f}  track_ang={r_track_ang:.4f}  "
+            f"feet_air={r_feet_air:.4f}  "
+            f"lin_vel_z={r_lin_vel_z:.4f}  action_rate={r_action_rate:.4f}"
         )
 
     # ==================================================================
